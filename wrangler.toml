@@ -1,0 +1,23 @@
+name = "echo-lms"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[triggers]
+crons = ["0 5 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-lms"
+database_id = "40fa4b8a-7e78-4c6f-aa7f-7fd5c2735e63"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "5d95f3270759401b992264b8bd31f953"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
