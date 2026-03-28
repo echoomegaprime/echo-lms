@@ -6,7 +6,12 @@ type Env = {
   CACHE: KVNamespace;
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
+  EMAIL_SENDER: Fetcher;
   ECHO_API_KEY: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  LMS_HMAC_KEY?: string;
+  SITE_URL?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -38,11 +43,33 @@ function tid(c: any): string { return sanitize(c.req.header('X-Tenant-ID') || c.
 function json(c: any, d: unknown, s = 200) { return c.json(d, s); }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-lms', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-lms', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
 
+async function generatePaymentToken(courseId: string, tenantId: string, hmacKey: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${courseId}:${tenantId}`));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function verifyStripeSignature(payload: string, header: string, secret: string): Promise<boolean> {
+  const parts = header.split(',').reduce((acc: Record<string, string>, p) => { const [k, v] = p.split('='); acc[k.trim()] = v; return acc; }, {});
+  const timestamp = parts['t']; const signature = parts['v1'];
+  if (!timestamp || !signature) return false;
+  const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+  if (age > 300 || age < -60) return false;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${timestamp}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== signature.length) return false;
+  let result = 0;
+  for (let i = 0; i < expected.length; i++) result |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  return result === 0;
+}
 
 interface RLState { c: number; t: number }
 async function rateLimit(env: Env, key: string, max: number, windowSec = 60): Promise<boolean> {
@@ -60,29 +87,29 @@ async function rateLimit(env: Env, key: string, max: number, windowSec = 60): Pr
   return true;
 }
 
-// Auth middleware
+// Rate limiting (exempt public + webhooks)
 app.use('*', async (c, next) => {
   const path = c.req.path;
-  if (path === '/health' || path === '/status' || c.req.method === 'GET') return next();
-  const key = c.req.header('X-Echo-API-Key') || c.req.header('Authorization')?.replace('Bearer ', '');
-  if (!key || key !== c.env.ECHO_API_KEY) return json(c, { error: 'Unauthorized' }, 401);
-  return next();
-});
-
-// Rate limiting
-app.use('*', async (c, next) => {
-  const path = c.req.path;
-  if (path === '/health' || path === '/status') return next();
+  if (path === '/health' || path === '/status' || path.startsWith('/public/') || path === '/webhooks/stripe') return next();
   const ip = c.req.header('CF-Connecting-IP') || 'unknown';
   const max = c.req.method === 'GET' ? 200 : 60;
   if (!await rateLimit(c.env, `${ip}:${c.req.method}`, max)) return json(c, { error: 'Rate limited' }, 429);
   return next();
 });
 
+// Auth middleware (exempt public + webhooks)
+app.use('*', async (c, next) => {
+  const path = c.req.path;
+  if (path === '/health' || path === '/status' || path.startsWith('/public/') || path === '/webhooks/stripe' || c.req.method === 'GET' || c.req.method === 'OPTIONS') return next();
+  const key = c.req.header('X-Echo-API-Key') || c.req.header('Authorization')?.replace('Bearer ', '');
+  if (!key || key !== c.env.ECHO_API_KEY) return json(c, { error: 'Unauthorized' }, 401);
+  return next();
+});
+
 // Health
-app.get('/', (c) => c.json({ service: 'echo-lms', version: '1.0.0', status: 'operational' }));
-app.get('/health', (c) => json(c, { status: 'ok', service: 'echo-lms', version: '1.0.0', timestamp: new Date().toISOString() }));
-app.get('/status', (c) => json(c, { status: 'operational', service: 'echo-lms', version: '1.0.0' }));
+app.get('/', (c) => c.json({ service: 'echo-lms', version: '2.0.0', status: 'operational', features: ['stripe-checkout', 'course-payments', 'public-catalog'] }));
+app.get('/health', (c) => json(c, { status: 'ok', service: 'echo-lms', version: '2.0.0', stripe: !!c.env.STRIPE_SECRET_KEY, timestamp: new Date().toISOString() }));
+app.get('/status', (c) => json(c, { status: 'operational', service: 'echo-lms', version: '2.0.0' }));
 
 // === TENANTS ===
 app.post('/tenants', async (c) => {
@@ -568,6 +595,241 @@ app.get('/analytics/student-activity', async (c) => {
     slog('error', 'Failed to get student activity', { error: e.message });
     return json(c, { error: 'Failed to get student activity', detail: e.message }, 500);
   }
+});
+
+// === STRIPE CHECKOUT ===
+// Create Stripe Checkout session for a course enrollment
+app.post('/courses/:id/checkout', async (c) => {
+  try {
+    if (!c.env.STRIPE_SECRET_KEY) return json(c, { error: 'Stripe not configured' }, 503);
+    const course = await c.env.DB.prepare('SELECT * FROM courses WHERE id=?').bind(c.req.param('id')).first() as any;
+    if (!course) return json(c, { error: 'Course not found' }, 404);
+    if (!course.price || course.price <= 0) return json(c, { error: 'Course is free, no checkout needed' }, 400);
+    if (course.status !== 'published') return json(c, { error: 'Course is not published' }, 400);
+    const amountCents = Math.round(Number(course.price) * 100);
+    const base = c.env.SITE_URL || new URL(c.req.url).origin;
+    const b = await c.req.json().catch(() => ({})) as any;
+    const params = new URLSearchParams();
+    params.set('mode', 'payment');
+    params.set('payment_method_types[]', 'card');
+    params.set('line_items[0][price_data][currency]', 'usd');
+    params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+    params.set('line_items[0][price_data][product_data][name]', `Course: ${course.title}`);
+    params.set('line_items[0][price_data][product_data][description]', course.description?.slice(0, 200) || `Enroll in ${course.title}`);
+    params.set('line_items[0][quantity]', '1');
+    params.set('success_url', `${base}/public/course/${course.id}?paid=true`);
+    params.set('cancel_url', `${base}/public/course/${course.id}`);
+    params.set('metadata[course_id]', course.id);
+    params.set('metadata[tenant_id]', course.tenant_id);
+    params.set('metadata[course_title]', course.title.slice(0, 500));
+    if (b.student_email) params.set('customer_email', sanitize(b.student_email, 255));
+    if (b.student_id) params.set('metadata[student_id]', b.student_id);
+    const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const session = await res.json() as any;
+    if (!res.ok) { slog('error', 'Stripe checkout failed', { status: res.status, error: session }); return json(c, { error: session.error?.message || 'Stripe error' }, 502); }
+    await c.env.DB.prepare("UPDATE courses SET stripe_checkout_id=?,updated_at=datetime('now') WHERE id=?").bind(session.id, course.id).run();
+    slog('info', 'Stripe checkout created', { course_id: course.id, session_id: session.id, amount: amountCents });
+    return json(c, { checkout_url: session.url, session_id: session.id });
+  } catch (e: any) {
+    slog('error', 'Course checkout error', { error: e.message });
+    return json(c, { error: 'Stripe unavailable', detail: e.message }, 502);
+  }
+});
+
+// Public course details page (HTML + JSON)
+app.get('/public/course/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    const course = await c.env.DB.prepare('SELECT c.*, i.name as instructor_name, i.bio as instructor_bio, i.avatar_url as instructor_avatar FROM courses c LEFT JOIN instructors i ON c.instructor_id=i.id WHERE c.id=?').bind(id).first() as any;
+    if (!course) return json(c, { error: 'Course not found' }, 404);
+    const modules = (await c.env.DB.prepare('SELECT id,title,description,order_num FROM modules WHERE course_id=? ORDER BY order_num').bind(id).all()).results;
+    const reviews = (await c.env.DB.prepare('SELECT r.rating,r.comment,s.name as student_name,r.created_at FROM reviews r JOIN students s ON r.student_id=s.id WHERE r.course_id=? ORDER BY r.created_at DESC LIMIT 5').bind(id).all()).results;
+    const lessonCount = await c.env.DB.prepare('SELECT COUNT(*) as c FROM lessons WHERE course_id=?').bind(id).first<any>();
+    const isPaid = c.req.query('paid') === 'true';
+    const accept = c.req.header('Accept') || '';
+    if (accept.includes('application/json')) {
+      return json(c, { course: { id: course.id, title: course.title, description: course.description, category: course.category, level: course.level, status: course.status, price: course.price, is_free: course.is_free, is_paid: course.is_paid, duration_hours: course.duration_hours, enrollment_count: course.enrollment_count, avg_rating: course.avg_rating, thumbnail_url: course.thumbnail_url, instructor: course.instructor_name ? { name: course.instructor_name, bio: course.instructor_bio } : null }, modules, reviews, lesson_count: lessonCount?.c || 0 });
+    }
+    const isFree = course.is_free || !course.price || course.price <= 0;
+    const priceDisplay = isFree ? 'FREE' : `$${Number(course.price).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+    const levelColors: Record<string, string> = { beginner: '#10b981', intermediate: '#f59e0b', advanced: '#ef4444' };
+    const levelColor = levelColors[course.level] || '#6b7280';
+    const stars = (n: number) => { let s = ''; for (let i = 0; i < 5; i++) s += i < Math.round(n) ? '\u2605' : '\u2606'; return s; };
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${sanitize(course.title, 100)} — Echo LMS</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;color:#1e293b}
+.top{background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);color:#fff;padding:32px 24px;text-align:center}.top h1{font-size:28px;font-weight:700;margin-bottom:8px}
+.top .sub{font-size:14px;opacity:0.85;margin-bottom:12px}.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;color:#fff;margin:0 4px}
+.card{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin:24px auto;max-width:760px;padding:32px}
+.meta{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;margin:16px 0}.meta-item{text-align:center;padding:8px 16px}.meta-item .val{font-size:20px;font-weight:700}.meta-item .label{font-size:12px;color:#64748b}
+.price-box{text-align:center;padding:24px;margin:16px 0;background:#f0f9ff;border-radius:12px}.price{font-size:36px;font-weight:800;color:#0f172a}.price-sub{font-size:13px;color:#64748b;margin-top:4px}
+.btn{display:block;width:100%;max-width:400px;margin:16px auto;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none}
+.btn-enroll{background:#4f46e5;color:#fff}.btn-enroll:hover{background:#4338ca}.btn-paid{background:#10b981;color:#fff;cursor:default}
+.section{margin-top:24px}.section h3{font-size:16px;font-weight:700;margin-bottom:12px;color:#0f172a;border-bottom:2px solid #e2e8f0;padding-bottom:8px}
+.module{padding:12px 0;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:12px}.module-num{width:28px;height:28px;background:#4f46e5;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}
+.module-title{font-weight:600;font-size:14px}.module-desc{font-size:12px;color:#64748b}
+.instructor{display:flex;gap:16px;align-items:center;padding:16px 0}.inst-avatar{width:56px;height:56px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#64748b}
+.review{padding:12px 0;border-bottom:1px solid #f1f5f9}.review-stars{color:#f59e0b;font-size:14px}.review-name{font-weight:600;font-size:13px;margin:4px 0}.review-comment{font-size:13px;color:#475569}
+.footer{text-align:center;color:#94a3b8;font-size:12px;padding:24px}
+</style></head><body>
+<div class="top">
+<h1>${sanitize(course.title, 200)}</h1>
+<div class="sub">${sanitize(course.description?.slice(0, 300) || '', 300)}</div>
+<span class="badge" style="background:${levelColor}">${course.level || 'All Levels'}</span>
+${course.category ? `<span class="badge" style="background:#6366f1">${sanitize(course.category, 50)}</span>` : ''}
+</div>
+<div class="card">
+<div class="meta">
+<div class="meta-item"><div class="val">${lessonCount?.c || 0}</div><div class="label">Lessons</div></div>
+<div class="meta-item"><div class="val">${modules.length}</div><div class="label">Modules</div></div>
+<div class="meta-item"><div class="val">${course.duration_hours || 0}h</div><div class="label">Duration</div></div>
+<div class="meta-item"><div class="val">${course.enrollment_count || 0}</div><div class="label">Students</div></div>
+<div class="meta-item"><div class="val">${course.avg_rating ? stars(course.avg_rating) : 'New'}</div><div class="label">${course.avg_rating ? `${Number(course.avg_rating).toFixed(1)} Rating` : 'No ratings yet'}</div></div>
+</div>
+<div class="price-box">
+<div class="price">${priceDisplay}</div>
+<div class="price-sub">${isFree ? 'No payment required' : 'One-time payment, lifetime access'}</div>
+</div>
+${isPaid ? '<a class="btn btn-paid">Payment Received — You\'re Enrolled!</a>' : isFree ? '<a class="btn btn-enroll" style="background:#10b981">Free Course — Enroll via API</a>' : `<form method="POST" action="/public/course/${course.id}/enroll"><button type="submit" class="btn btn-enroll">Enroll Now — ${priceDisplay}</button></form>`}
+${course.instructor_name ? `<div class="section"><h3>Instructor</h3><div class="instructor">${course.instructor_avatar ? `<img src="${sanitize(course.instructor_avatar, 500)}" class="inst-avatar" alt="">` : `<div class="inst-avatar">${course.instructor_name.charAt(0).toUpperCase()}</div>`}<div><div style="font-weight:700">${sanitize(course.instructor_name, 100)}</div>${course.instructor_bio ? `<div style="font-size:13px;color:#64748b;margin-top:4px">${sanitize(course.instructor_bio.slice(0, 300), 300)}</div>` : ''}</div></div></div>` : ''}
+${modules.length ? `<div class="section"><h3>Course Modules</h3>${(modules as any[]).map((m: any, i: number) => `<div class="module"><div class="module-num">${i + 1}</div><div><div class="module-title">${sanitize(m.title, 200)}</div>${m.description ? `<div class="module-desc">${sanitize(m.description.slice(0, 200), 200)}</div>` : ''}</div></div>`).join('')}</div>` : ''}
+${(reviews as any[]).length ? `<div class="section"><h3>Student Reviews</h3>${(reviews as any[]).map((r: any) => `<div class="review"><div class="review-stars">${stars(r.rating)}</div><div class="review-name">${sanitize(r.student_name, 100)}</div>${r.comment ? `<div class="review-comment">${sanitize(r.comment.slice(0, 300), 300)}</div>` : ''}</div>`).join('')}</div>` : ''}
+</div>
+<div class="footer">Powered by Echo LMS</div>
+</body></html>`;
+    return new Response(html, { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
+  } catch (e: any) {
+    slog('error', 'Public course page error', { error: e.message });
+    return json(c, { error: 'Failed to load course', detail: e.message }, 500);
+  }
+});
+
+// Public enrollment trigger — creates Stripe checkout and 303 redirects to Stripe
+app.post('/public/course/:id/enroll', async (c) => {
+  try {
+    if (!c.env.STRIPE_SECRET_KEY) return json(c, { error: 'Payments not configured' }, 503);
+    const id = c.req.param('id');
+    const course = await c.env.DB.prepare('SELECT * FROM courses WHERE id=?').bind(id).first() as any;
+    if (!course) return json(c, { error: 'Course not found' }, 404);
+    if (!course.price || course.price <= 0) return json(c, { error: 'Course is free' }, 400);
+    if (course.status !== 'published') return json(c, { error: 'Course not available' }, 400);
+    const amountCents = Math.round(Number(course.price) * 100);
+    const base = c.env.SITE_URL || new URL(c.req.url).origin;
+    const params = new URLSearchParams();
+    params.set('mode', 'payment');
+    params.set('payment_method_types[]', 'card');
+    params.set('line_items[0][price_data][currency]', 'usd');
+    params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+    params.set('line_items[0][price_data][product_data][name]', `Course: ${course.title}`);
+    params.set('line_items[0][price_data][product_data][description]', course.description?.slice(0, 200) || `Enroll in ${course.title}`);
+    params.set('line_items[0][quantity]', '1');
+    params.set('success_url', `${base}/public/course/${course.id}?paid=true`);
+    params.set('cancel_url', `${base}/public/course/${course.id}`);
+    params.set('metadata[course_id]', course.id);
+    params.set('metadata[tenant_id]', course.tenant_id);
+    params.set('metadata[course_title]', course.title.slice(0, 500));
+    const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const session = await res.json() as any;
+    if (!res.ok) { slog('error', 'Stripe public checkout failed', { error: session }); return json(c, { error: 'Payment service error' }, 502); }
+    await c.env.DB.prepare("UPDATE courses SET stripe_checkout_id=?,updated_at=datetime('now') WHERE id=?").bind(session.id, id).run();
+    slog('info', 'Public enrollment checkout created', { course_id: id, session_id: session.id, amount: amountCents });
+    return new Response(null, { status: 303, headers: { Location: session.url } });
+  } catch (e: any) {
+    slog('error', 'Public enrollment error', { error: e.message });
+    return json(c, { error: 'Payment unavailable', detail: e.message }, 502);
+  }
+});
+
+// Stripe Webhook — verify signature, process payment events, auto-enroll
+app.post('/webhooks/stripe', async (c) => {
+  const body = await c.req.text();
+  const sigHeader = c.req.header('Stripe-Signature') || '';
+  if (c.env.STRIPE_WEBHOOK_SECRET) {
+    if (!sigHeader) { slog('warn', 'Webhook missing signature'); return json(c, { error: 'Missing signature' }, 401); }
+    const valid = await verifyStripeSignature(body, sigHeader, c.env.STRIPE_WEBHOOK_SECRET);
+    if (!valid) { slog('warn', 'Webhook invalid signature', { ip: c.req.header('CF-Connecting-IP') || '' }); return json(c, { error: 'Invalid signature' }, 401); }
+  }
+  let event: any;
+  try { event = JSON.parse(body); } catch { return json(c, { error: 'Invalid JSON' }, 400); }
+  slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const courseId = session.metadata?.course_id;
+      const tenantId = session.metadata?.tenant_id;
+      const studentId = session.metadata?.student_id;
+      if (courseId && session.payment_status === 'paid') {
+        // Find or create student by email
+        let enrollStudentId = studentId;
+        if (!enrollStudentId && session.customer_details?.email) {
+          const email = session.customer_details.email;
+          const existing = await c.env.DB.prepare('SELECT id FROM students WHERE email=? AND tenant_id=?').bind(email, tenantId || '').first<any>();
+          if (existing) {
+            enrollStudentId = existing.id;
+          } else {
+            enrollStudentId = crypto.randomUUID();
+            await c.env.DB.prepare('INSERT INTO students (id,tenant_id,name,email) VALUES (?,?,?,?)').bind(enrollStudentId, tenantId || '', session.customer_details.name || email.split('@')[0], email).run();
+            slog('info', 'Auto-created student from payment', { student_id: enrollStudentId, email });
+          }
+        }
+        // Create enrollment if student found
+        if (enrollStudentId) {
+          const existingEnrollment = await c.env.DB.prepare('SELECT id FROM enrollments WHERE course_id=? AND student_id=?').bind(courseId, enrollStudentId).first();
+          if (!existingEnrollment) {
+            const lessonCount = await c.env.DB.prepare('SELECT COUNT(*) as c FROM lessons WHERE course_id=?').bind(courseId).first<any>();
+            const enrollmentId = crypto.randomUUID();
+            await c.env.DB.batch([
+              c.env.DB.prepare('INSERT INTO enrollments (id,course_id,student_id,tenant_id,total_lessons,payment_status,stripe_checkout_id,stripe_payment_intent,amount_paid) VALUES (?,?,?,?,?,?,?,?,?)').bind(enrollmentId, courseId, enrollStudentId, tenantId || '', lessonCount?.c || 0, 'paid', session.id, session.payment_intent || session.id, (session.amount_total || 0) / 100),
+              c.env.DB.prepare('UPDATE courses SET enrollment_count=enrollment_count+1,updated_at=datetime(\'now\') WHERE id=?').bind(courseId),
+            ]);
+            slog('info', 'Auto-enrollment created from payment', { enrollment_id: enrollmentId, course_id: courseId, student_id: enrollStudentId, amount: session.amount_total });
+          } else {
+            // Update existing enrollment payment status
+            await c.env.DB.prepare("UPDATE enrollments SET payment_status='paid',stripe_checkout_id=?,stripe_payment_intent=?,amount_paid=? WHERE course_id=? AND student_id=?").bind(session.id, session.payment_intent || session.id, (session.amount_total || 0) / 100, courseId, enrollStudentId).run();
+            slog('info', 'Existing enrollment marked paid', { course_id: courseId, student_id: enrollStudentId });
+          }
+        }
+        // Mark course as paid
+        await c.env.DB.prepare("UPDATE courses SET is_paid=1,updated_at=datetime('now') WHERE id=? AND is_paid=0").bind(courseId).run();
+        slog('info', 'Course payment recorded', { course_id: courseId, amount: session.amount_total });
+      }
+    } else if (event.type === 'checkout.session.expired') {
+      const session = event.data.object;
+      const courseId = session.metadata?.course_id;
+      if (courseId) {
+        await c.env.DB.prepare("UPDATE courses SET stripe_checkout_id=NULL,updated_at=datetime('now') WHERE id=? AND stripe_checkout_id=?").bind(courseId, session.id).run();
+        slog('info', 'Checkout expired', { course_id: courseId });
+      }
+    }
+  } catch (e: any) { slog('error', 'Webhook processing error', { error: e.message, type: event.type }); }
+  return json(c, { received: true });
+});
+
+// Schema migration for Stripe payment columns
+app.post('/admin/migrate-stripe', async (c) => {
+  const cols = [
+    { name: 'courses.stripe_product_id', sql: "ALTER TABLE courses ADD COLUMN stripe_product_id TEXT" },
+    { name: 'courses.is_paid', sql: "ALTER TABLE courses ADD COLUMN is_paid INTEGER DEFAULT 0" },
+    { name: 'courses.stripe_checkout_id', sql: "ALTER TABLE courses ADD COLUMN stripe_checkout_id TEXT" },
+    { name: 'enrollments.payment_status', sql: "ALTER TABLE enrollments ADD COLUMN payment_status TEXT DEFAULT 'unpaid'" },
+    { name: 'enrollments.stripe_checkout_id', sql: "ALTER TABLE enrollments ADD COLUMN stripe_checkout_id TEXT" },
+    { name: 'enrollments.stripe_payment_intent', sql: "ALTER TABLE enrollments ADD COLUMN stripe_payment_intent TEXT" },
+    { name: 'enrollments.amount_paid', sql: "ALTER TABLE enrollments ADD COLUMN amount_paid REAL DEFAULT 0" },
+  ];
+  const results: string[] = [];
+  for (const col of cols) {
+    try { await c.env.DB.prepare(col.sql).run(); results.push(`${col.name}: added`); }
+    catch (e: any) { results.push(`${col.name}: ${e.message?.includes('duplicate') ? 'exists' : e.message}`); }
+  }
+  slog('info', 'Stripe migration completed', { results });
+  return json(c, { migrated: true, results });
 });
 
 // === AI ENDPOINTS ===
