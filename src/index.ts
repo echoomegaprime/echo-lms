@@ -409,6 +409,18 @@ app.post('/ai/summarize-progress', async (c) => {
   });
 });
 
+app.onError((err, c) => {
+  if (err.message?.includes('JSON')) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  console.error(`[echo-lms] ${err.message}`);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+app.notFound((c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
 // Scheduled: cleanup old data
 export default {
   fetch: app.fetch,
