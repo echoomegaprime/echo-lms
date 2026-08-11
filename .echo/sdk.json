@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "name": "echo-lms",
+  "capabilities": [],
+  "note": "No SDK namespace collision. echo_search_caps queried for 'learning management system lms courses' and 'echo.lms', zero matches both times (2026-08-11). This repo's own job (multi-tenant course/quiz/enrollment/certificate management) has no existing SDK capability equivalent to claim or reconcile against.",
+  "entrypoints": ["scripts/certforge_journey.py"],
+  "data_classification": "restricted",
+  "network": "none"
+}
