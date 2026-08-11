@@ -42,6 +42,21 @@ function sanitizeBody(b: Record<string, unknown>): Record<string, unknown> {
 function tid(c: any): string { return sanitize(c.req.header('X-Tenant-ID') || c.req.query('tenant_id') || ''); }
 function json(c: any, d: unknown, s = 200) { return c.json(d, s); }
 
+function timingSafeEqual(a: string | undefined | null, b: string | undefined | null): boolean {
+  if (!a || !b) return false;
+  const enc = new TextEncoder();
+  const bufA = enc.encode(a);
+  const bufB = enc.encode(b);
+  const len = Math.max(bufA.length, bufB.length, 1);
+  const padA = new Uint8Array(len);
+  const padB = new Uint8Array(len);
+  padA.set(bufA);
+  padB.set(bufB);
+  let diff = bufA.length ^ bufB.length;
+  for (let i = 0; i < len; i++) diff |= padA[i] ^ padB[i];
+  return diff === 0;
+}
+
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
   const entry = { ts: new Date().toISOString(), level, worker: 'echo-lms', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
@@ -104,12 +119,22 @@ app.use('*', async (c, next) => {
   return next();
 });
 
-// Auth middleware (exempt public + webhooks)
+// Auth middleware (exempt only the routes actually meant to be public: health,
+// the /public/* storefront, the Stripe webhook (its own signature check), and
+// certificate verification. Every other route -- INCLUDING every other GET,
+// such as /tenants/:id, /students, /students/:sid/enrollments, and
+// /analytics/* -- requires the API key. The repo as found exempted every GET
+// request unconditionally, which exposed student PII (names/emails) and
+// revenue analytics to anyone who could guess an id, with no credential at
+// all -- the same class of bug as every "GET routes bypass auth" fix
+// elsewhere in this consolidation campaign.)
 app.use('*', async (c, next) => {
   const path = c.req.path;
-  if (path === '/health' || path === '/status' || path.startsWith('/public/') || path === '/webhooks/stripe' || c.req.method === 'GET' || c.req.method === 'OPTIONS') return next();
+  const isPublicPath = path === '/' || path === '/health' || path === '/status' || path.startsWith('/public/')
+    || path === '/webhooks/stripe' || path.startsWith('/certificates/verify/');
+  if (isPublicPath || c.req.method === 'OPTIONS') return next();
   const key = c.req.header('X-Echo-API-Key') || c.req.header('Authorization')?.replace('Bearer ', '');
-  if (!key || key !== c.env.ECHO_API_KEY) return json(c, { error: 'Unauthorized' }, 401);
+  if (!timingSafeEqual(key, c.env.ECHO_API_KEY)) return json(c, { error: 'Unauthorized' }, 401);
   return next();
 });
 

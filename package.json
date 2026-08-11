@@ -2,10 +2,12 @@
   "name": "echo-lms",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "tsc --noEmit && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "hono": "^4.4.0"
